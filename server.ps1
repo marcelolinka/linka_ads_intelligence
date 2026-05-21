@@ -8,7 +8,7 @@ $listener.Start()
 Write-Host "Servidor rodando em http://localhost:$port/" -ForegroundColor Green
 Write-Host "Pressione Ctrl+C para parar." -ForegroundColor Gray
 
-Start-Process "http://localhost:$port/linka_ads_intelligence_v3.html"
+Start-Process "http://localhost:$port/index.html"
 
 try {
     while ($listener.IsListening) {
@@ -17,7 +17,7 @@ try {
         $res = $ctx.Response
 
         $urlPath = $req.Url.LocalPath.TrimStart('/')
-        if ($urlPath -eq '' -or $urlPath -eq '/') { $urlPath = 'linka_ads_intelligence_v3.html' }
+        if ($urlPath -eq '' -or $urlPath -eq '/') { $urlPath = 'index.html' }
 
         $filePath = Join-Path $root $urlPath
 

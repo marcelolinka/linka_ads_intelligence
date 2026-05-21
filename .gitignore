@@ -1,1 +1,6 @@
 .claude/
+api/.env
+api/.venv/
+api/__pycache__/
+api/routes/__pycache__/
+*.pyc
