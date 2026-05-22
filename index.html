@@ -1416,54 +1416,52 @@ function roasMarginalEstimado(c, deltaRatio) {
   return Math.max(0, (c.roas ?? 1) * fator);
 }
 
-// ROAS marginal com fator de pressão por dias (mesmo valor, menos dias = mais agressivo)
-// historicalDias: período do arquivo importado (ex: 19 dias = 01/mai a 19/mai)
-// dias: período alvo da simulação (dias restantes do mês ou 30.4)
-// Lógica: custo histórico é normalizado para o período alvo.
-// Menos dias → custo projetado menor → mesmo incremento representa % maior → mais degradação de ROAS
-// periodBudget = orçamento do período alvo:
-//   "este mês"    → saldo restante (ex: R$111k)
-//   "próximo mês" → orçamento mensal completo (ex: R$320k)
-// deltaRatio = alocação / gasto proporcional da campanha no período
-// Quanto menor o periodBudget (saldo curto), maior o deltaRatio → mais degradação.
-function roasMarginalDelta(c, alloc, totalCusto, periodBudget) {
-  const k   = getElasticidade(c);
-  const sat = getSaturacao(c.impLostReal ?? c.impLost ?? 0);
-  const campShare        = totalCusto > 0 ? c.custo / totalCusto : 0;
-  const campPeriodBudget = campShare * periodBudget;
-  const deltaRatio       = campPeriodBudget > 0 ? alloc / campPeriodBudget : 0;
-  const fator = 1 - k * deltaRatio * (0.5 + sat * 0.5);
-  return Math.max(0, (c.roas ?? 1) * fator);
+// Pressão diária: mesmo valor extra em menos dias = mais pressão diária = mais degradação de ROAS
+// dias: período da simulação (diasAtual ou 30.4)
+// historicalDias: período do arquivo importado
+// Quanto menos dias, maior o gasto diário extra → maior deltaRatio → mais degradação
+function roasMarginalDelta(c, alloc, dias, historicalDias) {
+  const k      = getElasticidade(c);
+  const sat    = getSaturacao(c.impLostReal ?? c.impLost ?? 0);
+  const hDaily = (c.custo||1) / Math.max(1, historicalDias); // gasto histórico por dia
+  const eDaily = alloc / Math.max(1, dias);                  // extra por dia neste período
+  const delta  = eDaily / hDaily;                            // quanto a mais por dia vs baseline
+  const fator  = Math.max(0.1, 1 - k * delta * (0.5 + sat * 0.5));
+  return (c.roas||0) * fator;
 }
 
-// periodBudget: orçamento projetado para o período (saldo ou budget mensal)
-function calcScenario(valorExtra, periodBudget) {
+// dias: dias disponíveis no período (diasAtual ou 30.4 para próximo mês)
+// historicalDias: dias do arquivo importado
+// Vermelha recebe fatia pequena (não zero) → dias sempre afeta o cálculo
+function calcScenario(valorExtra, dias, historicalDias) {
   const totalCusto = camps.reduce((s,c) => s + (c.custo||0), 0);
-  const verdes   = camps.filter(c => getZona(c) === 'verde');
-  const amarelas = camps.filter(c => getZona(c) === 'amarela');
-  const vermelhas= camps.filter(c => getZona(c) === 'vermelha');
+  const verdes    = camps.filter(c => getZona(c) === 'verde');
+  const amarelas  = camps.filter(c => getZona(c) === 'amarela');
+  const vermelhas = camps.filter(c => getZona(c) === 'vermelha');
 
-  const poolV = verdes.length   ? valorExtra * (amarelas.length ? 0.75 : 1.0) : 0;
-  const poolA = amarelas.length ? valorExtra * (verdes.length   ? 0.25 : 1.0) : 0;
+  // Pesos por zona: verde prioridade máxima, vermelha recebe pouco mas não zero
+  // (garante que `dias` sempre influencia o resultado, mesmo sem impLost nos dados)
+  const ZONA_W = { verde: 4.0, amarela: 1.5, vermelha: 0.3 };
+  const weights = camps.map(c => {
+    const score = escalaScore ? escalaScore(c) : (c.roas||1);
+    return score * (ZONA_W[getZona(c)] ?? 0.3);
+  });
+  const totalW = weights.reduce((a,b)=>a+b,0) || 1;
+  const allocs = camps.map((c,i) => valorExtra * weights[i] / totalW);
 
-  function distribuir(grupo, pool) {
-    if (!grupo.length || pool <= 0) return grupo.map(() => 0);
-    const scores = grupo.map(c => escalaScore ? escalaScore(c) : (c.roas||1));
-    const total  = scores.reduce((a,b)=>a+b,0)||1;
-    return scores.map(s => pool*(s/total));
-  }
+  const allEntries = camps.map((c,i) => ({
+    roas:  roasMarginalDelta(c, allocs[i], dias, historicalDias),
+    custo: (c.custo||0) + allocs[i],
+  }));
 
-  const allocV = distribuir(verdes,   poolV);
-  const allocA = distribuir(amarelas, poolA);
+  const novoCusto = allEntries.reduce((s,x) => s + x.custo, 0);
+  const roasProj  = novoCusto > 0
+    ? allEntries.reduce((s,x) => s + x.roas * x.custo, 0) / novoCusto : 0;
 
-  const allEntries = [
-    ...verdes.map((c,i)   => ({ roas: roasMarginalDelta(c, allocV[i], totalCusto, periodBudget), custo: (c.custo||0)+allocV[i] })),
-    ...amarelas.map((c,i) => ({ roas: roasMarginalDelta(c, allocA[i], totalCusto, periodBudget), custo: (c.custo||0)+allocA[i] })),
-    ...vermelhas.map(c    => ({ roas: c.roas||0, custo: c.custo||0 })),
-  ];
-  const novoCusto = totalCusto + valorExtra;
-  const roasProj  = novoCusto > 0 ? allEntries.reduce((s,x)=>s+x.roas*x.custo,0)/novoCusto : 0;
-  return { roasProj, verdes, amarelas, vermelhas, allocV, allocA, totalCusto, periodBudget };
+  const allocV = verdes.map(c   => allocs[camps.findIndex(x => x === c)]);
+  const allocA = amarelas.map(c => allocs[camps.findIndex(x => x === c)]);
+
+  return { roasProj, verdes, amarelas, vermelhas, allocV, allocA, totalCusto, dias };
 }
 
 function recLabel(deltaPct) {
@@ -1527,8 +1525,8 @@ function simularIncremento() {
   comp.style.display = 'block';
 
   // ── Cenário base (valor digitado) ──
-  const scAtual = calcScenario(val, saldoAtual);
-  const scProx  = calcScenario(val, budgetProx);
+  const scAtual = calcScenario(val, diasAtual, historicalDias);
+  const scProx  = calcScenario(val, diasProx,  historicalDias);
   const dpAtual = roasAtual > 0 ? ((scAtual.roasProj - roasAtual) / roasAtual) * 100 : 0;
   const dpProx  = roasAtual > 0 ? ((scProx.roasProj  - roasAtual) / roasAtual) * 100 : 0;
 
@@ -1554,8 +1552,8 @@ function simularIncremento() {
   const faixas = [-0.30, -0.20, -0.10, 0, 0.10, 0.20, 0.30];
   const scenarioRows = faixas.map(f => {
     const v   = Math.round(val * (1 + f));
-    const sA  = calcScenario(v, saldoAtual);
-    const sP  = calcScenario(v, budgetProx);
+    const sA  = calcScenario(v, diasAtual, historicalDias);
+    const sP  = calcScenario(v, diasProx,  historicalDias);
     const dpA = roasAtual > 0 ? ((sA.roasProj - roasAtual) / roasAtual) * 100 : 0;
     const dpP = roasAtual > 0 ? ((sP.roasProj - roasAtual) / roasAtual) * 100 : 0;
     const rA  = recLabel(dpA);
@@ -1595,7 +1593,7 @@ function simularIncremento() {
     const z = zonaLabel[zona];
     return `<tr><td colspan="4" style="padding:14px 20px 6px;font-size:11px;font-weight:700;letter-spacing:.06em;color:${z.cor};border-top:1px solid var(--border2);">${z.icon} ${z.label} — ${z.desc}</td></tr>`
       + grupo.map((c,i) => {
-          const rp = roasMarginalDelta(c, allocs[i], totalCusto, saldoAtual);
+          const rp = roasMarginalDelta(c, allocs[i], diasAtual, historicalDias);
           return `<tr style="border-bottom:1px solid var(--border);">
             <td style="padding:11px 20px;color:var(--text);font-weight:500;">${c.name}</td>
             <td style="padding:11px 12px;color:var(--text3);font-size:12px;">${c.tipo}</td>
