@@ -1372,15 +1372,19 @@ function goTab(name){
    MODELO DE INCREMENTO MARGINAL DE VERBA
 ══════════════════════════════════════════ */
 
-// Coeficiente de degradação de ROAS por tipo (k)
-// Quanto maior k, mais inelástico (ROAS cai mais rápido com escala)
+// Coeficiente de degradação de ROAS por tipo (k) — calibrado via simulação
+// Modelo: fator = exp(-k × delta × satFactor)
+// Referência de mercado (conta saturada, sat=1.0):
+//   +35% budget mês completo  → -6% a -10% ROAS esperado
+//   +35% budget em 10 dias    → -18% a -25% ROAS esperado
+// Validado com historicalDias=20, totalCusto=R$130k, valorExtra=R$50k
 const ELASTICIDADE = {
-  'Shopping':   0.12,
-  'PMax':       0.18,
-  'Search':     0.22,
-  'DSA Search': 0.20,
-  'Demand Gen': 0.10,
-  'Brand Search':0.45,
+  'Shopping':    0.20,   // era 0.12 — inventory-driven mas satura com escala
+  'PMax':        0.30,   // era 0.18 — automatizado, dispersa budget rapidamente
+  'Search':      0.38,   // era 0.22 — CPCs sobem rápido ao escalar keywords
+  'DSA Search':  0.32,   // era 0.20
+  'Demand Gen':  0.15,   // era 0.10 — upper funnel, impacto mais gradual
+  'Brand Search':0.70,   // era 0.45 — demanda de marca é fixa, muito inelástico
 };
 
 function getElasticidade(c) {
@@ -1505,10 +1509,11 @@ function calcScenario(valorExtra, dias, historicalDias) {
   const roasProj  = novoCusto > 0
     ? allEntries.reduce((s,x) => s + x.roas * x.custo, 0) / novoCusto : 0;
 
-  const allocVfinal = verdes.map(c   => allocs[camps.indexOf(c)]);
-  const allocAfinal = amarelas.map(c => allocs[camps.indexOf(c)]);
+  const allocVfinal = verdes.map(c    => allocs[camps.indexOf(c)]);
+  const allocAfinal = amarelas.map(c  => allocs[camps.indexOf(c)]);
+  const allocRfinal = vermelhas.map(c => allocs[camps.indexOf(c)]);
 
-  return { roasProj, verdes, amarelas, vermelhas, allocV: allocVfinal, allocA: allocAfinal, totalCusto, dias };
+  return { roasProj, verdes, amarelas, vermelhas, allocV: allocVfinal, allocA: allocAfinal, allocR: allocRfinal, totalCusto, dias };
 }
 
 function recLabel(deltaPct) {
@@ -1649,9 +1654,31 @@ function simularIncremento() {
           </tr>`;
         }).join('');
   }
-  function renderVermelhas(grupo) {
+  const allVermelha = scAtual.verdes.length === 0 && scAtual.amarelas.length === 0;
+
+  // Vermelha sem verde/amarela: mostra alloc com aviso de alto risco
+  // Vermelha com verde/amarela: mostra apenas o motivo (não há alloc para elas)
+  function renderVermelhas(grupo, allocsR) {
     if (!grupo.length) return '';
     const z = zonaLabel['vermelha'];
+    if (allVermelha) {
+      // Todas saturadas: mostra distribuição proporcional com alerta
+      return `<tr><td colspan="4" style="padding:14px 20px 6px;font-size:11px;font-weight:700;letter-spacing:.06em;color:${z.cor};border-top:1px solid var(--border2);">
+          ${z.icon} ${z.label} — distribuição automática proporcional ao gasto
+          <span style="font-size:10px;font-weight:400;color:var(--text3);margin-left:8px;">↑ inclua Impression Share Lost no relatório para identificar campanhas para escalar</span>
+        </td></tr>`
+        + grupo.map((c,i) => {
+            const rp = roasMarginalDelta(c, (allocsR||[])[i]||0, diasAtual, historicalDias);
+            const motivo = c.isBrand ? 'inelástico' : 'saturado';
+            return `<tr style="border-bottom:1px solid var(--border);">
+              <td style="padding:11px 20px;color:var(--text);font-weight:500;">${c.name}</td>
+              <td style="padding:11px 12px;color:var(--text3);font-size:12px;">${c.tipo} · <em style="font-size:11px;">${motivo}</em></td>
+              <td style="padding:11px 12px;text-align:right;color:var(--red);font-weight:700;">+R$ ${Math.round((allocsR||[])[i]||0).toLocaleString('pt-BR')}</td>
+              <td style="padding:11px 20px;text-align:right;color:${rp>=10?'var(--amber)':'var(--red)'};font-weight:700;">${rp.toFixed(1)}x ⚠️</td>
+            </tr>`;
+          }).join('');
+    }
+    // Mix com verde/amarela: vermelha não recebe alloc ativo (só background)
     return `<tr><td colspan="4" style="padding:14px 20px 6px;font-size:11px;font-weight:700;letter-spacing:.06em;color:${z.cor};border-top:1px solid var(--border2);">${z.icon} ${z.label} — não escalar</td></tr>`
       + grupo.map(c => {
           const motivo = c.isBrand ? 'inelástico — demanda de marca não cresce com budget' : 'saturado — demanda já capturada';
@@ -1663,8 +1690,11 @@ function simularIncremento() {
         }).join('');
   }
 
-  document.getElementById('sc-table-sub').textContent =
-    `R$ ${Math.round(val).toLocaleString('pt-BR')} a distribuir · ${scAtual.verdes.length} Zona Verde · ${scAtual.amarelas.length} Zona Amarela`;
+  const subLabel = allVermelha
+    ? `R$ ${Math.round(val).toLocaleString('pt-BR')} a distribuir · todas em Zona Vermelha — sem campanhas para escalar`
+    : `R$ ${Math.round(val).toLocaleString('pt-BR')} a distribuir · ${scAtual.verdes.length} Zona Verde · ${scAtual.amarelas.length} Zona Amarela`;
+  document.getElementById('sc-table-sub').textContent = subLabel;
+
   document.getElementById('scale-table-body').innerHTML = `
     <table style="width:100%;border-collapse:collapse;font-size:13px;">
       <thead><tr style="border-bottom:1px solid var(--border2);">
@@ -1676,7 +1706,7 @@ function simularIncremento() {
       <tbody>
         ${renderGrupo(scAtual.verdes,   scAtual.allocV, 'verde')}
         ${renderGrupo(scAtual.amarelas, scAtual.allocA, 'amarela')}
-        ${renderVermelhas(scAtual.vermelhas)}
+        ${renderVermelhas(scAtual.vermelhas, scAtual.allocR)}
       </tbody>
     </table>`;
 }
