@@ -1416,38 +1416,85 @@ function roasMarginalEstimado(c, deltaRatio) {
   return Math.max(0, (c.roas ?? 1) * fator);
 }
 
-// Pressão diária: mesmo valor extra em menos dias = mais pressão diária = mais degradação de ROAS
-// dias: período da simulação (diasAtual ou 30.4)
-// historicalDias: período do arquivo importado
-// Quanto menos dias, maior o gasto diário extra → maior deltaRatio → mais degradação
+// ─── DEGRADAÇÃO DE ROAS — fórmula exponencial ────────────────────────────────
+// Lógica: medir a pressão diária adicional e aplicar decaimento exponencial.
+//
+//   delta = (alloc / dias) / (custo / historicalDias)
+//         = quanto a mais por dia vs. gasto histórico diário
+//
+// Fórmula: fator = exp(-k × delta × satFactor)
+//   • Sempre positivo (nunca vai a zero nem negativo)
+//   • delta=0  → fator=1   (sem verba extra = ROAS inalterado)
+//   • delta=∞  → fator→0  (verba infinita = ROAS tende a zero gradualmente)
+//   • sat=0.05 (muita demanda, verde): satFactor=0.24 → degradação suave
+//   • sat=1.0  (saturada, vermelha):   satFactor=1.0  → degradação máxima
+//
+// Validado via simulação Python com os dados reais do screenshot.
 function roasMarginalDelta(c, alloc, dias, historicalDias) {
-  const k      = getElasticidade(c);
-  const sat    = getSaturacao(c.impLostReal ?? c.impLost ?? 0);
-  const hDaily = (c.custo||1) / Math.max(1, historicalDias); // gasto histórico por dia
-  const eDaily = alloc / Math.max(1, dias);                  // extra por dia neste período
-  const delta  = eDaily / hDaily;                            // quanto a mais por dia vs baseline
-  const fator  = Math.max(0.1, 1 - k * delta * (0.5 + sat * 0.5));
+  const k         = getElasticidade(c);
+  const sat       = getSaturacao(c.impLostReal ?? c.impLost ?? 0);
+  const hDaily    = (c.custo||1) / Math.max(1, historicalDias);
+  const eDaily    = alloc / Math.max(1, dias);
+  const delta     = eDaily / hDaily;
+  const satFactor = 0.2 + sat * 0.8;   // [0.20 para sat=0, 1.0 para sat=1]
+  const fator     = Math.exp(-k * delta * satFactor);
   return (c.roas||0) * fator;
 }
 
-// dias: dias disponíveis no período (diasAtual ou 30.4 para próximo mês)
-// historicalDias: dias do arquivo importado
-// Vermelha recebe fatia pequena (não zero) → dias sempre afeta o cálculo
+// ─── DISTRIBUIÇÃO DE VERBA POR ZONA ──────────────────────────────────────────
+// Regras de alocação:
+//   • Verde:    70% do extra — distribuído por escalaScore (campanha com mais potencial)
+//   • Amarela:  20% do extra — distribuído por escalaScore
+//   • Vermelha: 10% do extra — distribuído PROPORCIONAL AO GASTO histórico
+//
+// Vermelha recebe proporcional ao gasto (não por score) porque:
+//   1. Evita que campanhas pequenas (ex: Brand com ROAS alto mas gasto baixo)
+//      recebam alocação desproporcional, causando delta explosivo
+//   2. Garante que `dias` sempre influencia o cálculo (diferencia Este mês × Próx mês)
+//      mesmo quando todos são vermelha e não há dados de impLost
+//
+// Pools se ajustam se não houver verde ou amarela:
+//   Só verde:   85% verde + 15% vermelha
+//   Só amarela: 80% amarela + 20% vermelha
+//   Só vermelha:100% proporcional ao gasto
 function calcScenario(valorExtra, dias, historicalDias) {
   const totalCusto = camps.reduce((s,c) => s + (c.custo||0), 0);
   const verdes    = camps.filter(c => getZona(c) === 'verde');
   const amarelas  = camps.filter(c => getZona(c) === 'amarela');
   const vermelhas = camps.filter(c => getZona(c) === 'vermelha');
 
-  // Pesos por zona: verde prioridade máxima, vermelha recebe pouco mas não zero
-  // (garante que `dias` sempre influencia o resultado, mesmo sem impLost nos dados)
-  const ZONA_W = { verde: 4.0, amarela: 1.5, vermelha: 0.3 };
-  const weights = camps.map(c => {
-    const score = escalaScore ? escalaScore(c) : (c.roas||1);
-    return score * (ZONA_W[getZona(c)] ?? 0.3);
+  const hV = verdes.length > 0, hA = amarelas.length > 0;
+  let poolV, poolA, poolR;
+  if (hV && hA)  { poolV = valorExtra*0.70; poolA = valorExtra*0.20; poolR = valorExtra*0.10; }
+  else if (hV)   { poolV = valorExtra*0.85; poolA = 0;               poolR = valorExtra*0.15; }
+  else if (hA)   { poolV = 0;               poolA = valorExtra*0.80; poolR = valorExtra*0.20; }
+  else           { poolV = 0;               poolA = 0;               poolR = valorExtra;       }
+
+  // Verde/Amarela: peso por potencial (escalaScore)
+  const distScore = (grupo, pool) => {
+    if (!grupo.length || pool <= 0) return grupo.map(() => 0);
+    const scores = grupo.map(c => typeof escalaScore === 'function' ? escalaScore(c) : (c.roas||1));
+    const total  = scores.reduce((a,b)=>a+b,0) || 1;
+    return scores.map(s => pool * s / total);
+  };
+  // Vermelha: peso proporcional ao gasto histórico (evita delta explosivo)
+  const distGasto = (grupo, pool) => {
+    if (!grupo.length || pool <= 0) return grupo.map(() => 0);
+    const total = grupo.reduce((s,c) => s + (c.custo||1), 0) || 1;
+    return grupo.map(c => pool * (c.custo||1) / total);
+  };
+
+  const allocV = distScore(verdes,    poolV);
+  const allocA = distScore(amarelas,  poolA);
+  const allocR = distGasto(vermelhas, poolR);
+
+  // Monta mapa indexado pelo camp original
+  const allocs = camps.map(c => {
+    const iv = verdes.indexOf(c);    if (iv >= 0) return allocV[iv];
+    const ia = amarelas.indexOf(c);  if (ia >= 0) return allocA[ia];
+    const ir = vermelhas.indexOf(c); if (ir >= 0) return allocR[ir];
+    return 0;
   });
-  const totalW = weights.reduce((a,b)=>a+b,0) || 1;
-  const allocs = camps.map((c,i) => valorExtra * weights[i] / totalW);
 
   const allEntries = camps.map((c,i) => ({
     roas:  roasMarginalDelta(c, allocs[i], dias, historicalDias),
@@ -1458,10 +1505,10 @@ function calcScenario(valorExtra, dias, historicalDias) {
   const roasProj  = novoCusto > 0
     ? allEntries.reduce((s,x) => s + x.roas * x.custo, 0) / novoCusto : 0;
 
-  const allocV = verdes.map(c   => allocs[camps.findIndex(x => x === c)]);
-  const allocA = amarelas.map(c => allocs[camps.findIndex(x => x === c)]);
+  const allocVfinal = verdes.map(c   => allocs[camps.indexOf(c)]);
+  const allocAfinal = amarelas.map(c => allocs[camps.indexOf(c)]);
 
-  return { roasProj, verdes, amarelas, vermelhas, allocV, allocA, totalCusto, dias };
+  return { roasProj, verdes, amarelas, vermelhas, allocV: allocVfinal, allocA: allocAfinal, totalCusto, dias };
 }
 
 function recLabel(deltaPct) {
