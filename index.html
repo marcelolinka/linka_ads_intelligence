@@ -1372,19 +1372,22 @@ function goTab(name){
    MODELO DE INCREMENTO MARGINAL DE VERBA
 ══════════════════════════════════════════ */
 
-// Coeficiente de degradação de ROAS por tipo (k) — calibrado via simulação
+// Coeficiente de degradação de ROAS por tipo (k) — modelo CONSERVADOR/PESSIMISTA
+// Filosofia: melhor projetar cenário pior e surpreender positivamente
+//            do que prometer otimismo e decepcionar na hora do investimento.
+//
 // Modelo: fator = exp(-k × delta × satFactor)
-// Referência de mercado (conta saturada, sat=1.0):
-//   +35% budget mês completo  → -6% a -10% ROAS esperado
-//   +35% budget em 10 dias    → -18% a -25% ROAS esperado
-// Validado com historicalDias=20, totalCusto=R$130k, valorExtra=R$50k
+// Referência calibrada (conta saturada, sat=1.0, +35-40% budget):
+//   Mês completo (30d):  PMax -13%, Shopping -10%, Search -17%
+//   Comprimido (10d):    PMax -35%, Shopping -27%, Search -43%
+// Fonte: test_pessimista.py — simulação com dados reais do projeto
 const ELASTICIDADE = {
-  'Shopping':    0.20,   // era 0.12 — inventory-driven mas satura com escala
-  'PMax':        0.30,   // era 0.18 — automatizado, dispersa budget rapidamente
-  'Search':      0.38,   // era 0.22 — CPCs sobem rápido ao escalar keywords
-  'DSA Search':  0.32,   // era 0.20
-  'Demand Gen':  0.15,   // era 0.10 — upper funnel, impacto mais gradual
-  'Brand Search':0.70,   // era 0.45 — demanda de marca é fixa, muito inelástico
+  'Shopping':    0.40,   // satura com escala — produto com volume finito
+  'PMax':        0.55,   // dispersa para placements de menor qualidade
+  'Search':      0.72,   // CPCs inflacionam rapidamente em leilões disputados
+  'DSA Search':  0.60,   // similar ao Search, menor controle de qualidade
+  'Demand Gen':  0.22,   // upper funnel — impacto gradual mas real
+  'Brand Search':1.10,   // demanda de marca é fixa — budget extra não compra mais volume
 };
 
 function getElasticidade(c) {
